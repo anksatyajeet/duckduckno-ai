@@ -1,9 +1,22 @@
-import {Hono} from 'hono'
-import {z} from "zod";
-import {validator} from "hono/validator";
-import {OpenAIRequest, OpenAIResponse, OpenAIStreamResponse} from "./types";
-import {streamSSE} from 'hono/streaming'
-import {cors} from 'hono/cors'
+import { Hono } from 'hono'
+import { z } from "zod"
+import { validator } from "hono/validator"
+import { OpenAIRequest, OpenAIResponse, OpenAIStreamResponse } from "./types"
+import { streamSSE } from 'hono/streaming'
+import { cors } from 'hono/cors'
+
+// Enhanced logging function
+const logger = {
+  info: (message: string, data?: any) => {
+    console.log(`[INFO] ${message}`, data ? JSON.stringify(data, null, 2) : '')
+  },
+  error: (message: string, error: any) => {
+    console.error(`[ERROR] ${message}`, error)
+  },
+  debug: (message: string, data?: any) => {
+    console.debug(`[DEBUG] ${message}`, data ? JSON.stringify(data, null, 2) : '')
+  }
+}
 
 const headers = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
@@ -23,10 +36,13 @@ const headers = {
   "x-vqd-accept": "1",
   "cache-control": "no-store"
 }
+
 const statusURL = "https://duckduckgo.com/duckchat/v1/status"
 const chatURL = "https://duckduckgo.com/duckchat/v1/chat"
+
+// Updated schema to allow any model string
 const schema = z.object({
-  model: z.string().default("gpt-4o-mini"),
+  model: z.string(),
   messages: z.array(z.object({
     role: z.string(),
     content: z.string()
@@ -34,7 +50,8 @@ const schema = z.object({
   stream: z.boolean().optional()
 })
 
-const models = [
+// Default supported models (but not limited to these)
+const defaultModels = [
   "gpt-4o-mini",
   "claude-3-haiku-20240307",
   "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
@@ -48,76 +65,96 @@ app.use('/*', cors({
 }))
 
 const getXcqd4 = async function () {
-  const res = await fetch(statusURL, {
-    method: "GET",
-    headers: headers,
-  })
-  return res.headers.get("x-vqd-4")
+  try {
+    logger.debug('Fetching x-vqd-4 token')
+    const res = await fetch(statusURL, {
+      method: "GET",
+      headers: headers,
+    })
+    const token = res.headers.get("x-vqd-4")
+    logger.debug('Received x-vqd-4 token', { token })
+    return token
+  } catch (error) {
+    logger.error('Error fetching x-vqd-4 token', error)
+    throw error
+  }
 }
 
 app.get('/', (c) => {
+  logger.info('Received request to root endpoint')
   return c.text('Hello Hono!')
 })
+
 app.get("/v1/models", (c) => {
-  const list = []
-  for (let model of models) {
-    list.push({
-      id: model,
-      object: "model",
-      "created": 1686935002,
-      "owned_by": "duckduckgo-ai",
-    })
-  }
+  logger.info('Fetching available models')
+  const list = defaultModels.map(model => ({
+    id: model,
+    object: "model",
+    created: 1686935002,
+    owned_by: "duckduckgo-ai",
+  }))
+  
   return c.json({
-    "object": "list",
-    "data": list
+    object: "list",
+    data: list
   })
 })
-
 
 app.post("/v1/chat/completions", validator('json', (value, c) => {
   const parsed = schema.safeParse(value)
   if (!parsed.success) {
+    logger.error('Validation error', parsed.error)
     return c.json({error: parsed.error.errors[0].message}, 400)
   }
   return parsed.data
 }), async (c) => {
   // @ts-ignore
   const apikey = c.env["apikey"] ?? ''
+  
+  // API key validation
   if (apikey) {
     const authorization = c.req.header("Authorization")
     if (!authorization) {
+      logger.error('Missing authorization header')
       return c.json({"error": "authorization error"}, 401)
     }
     if (apikey !== authorization.substring(7)) {
+      logger.error('Invalid API key')
       return c.json({"error": "apikey error"}, 401)
     }
   }
 
-
   const params = await c.req.json<OpenAIRequest>()
+  logger.info('Received chat completion request', {
+    model: params.model,
+    messageCount: params.messages.length,
+    stream: params.stream
+  })
+
   const requestParams = {
-    "model": params.model,
-    "messages": []
+    model: params.model,
+    messages: params.messages.map(message => ({
+      role: message.role === 'system' ? 'user' : message.role,
+      content: message.content
+    }))
   }
-  const messages = []
-  for (let message of params.messages) {
-    if (message.role === 'system') {
-      messages.push({"role": "user", "content": message.content})
-    } else {
-      messages.push(message)
-    }
-  }
-  // @ts-ignore
-  requestParams["messages"] = messages
+
   try {
     let x4 = c.req.header("x-vqd-4")
     if (!x4) {
       x4 = await getXcqd4() || ""
     }
     if (!x4) {
+      logger.error('Failed to obtain x-vqd-4 token')
       return c.json({error: "x-xqd-4 get error"}, 400)
     }
+
+    logger.debug('Making request to DuckDuckGo API', {
+      url: chatURL,
+      vqd4: x4,
+      model: params.model
+    })
+
     const resp = await fetch(chatURL, {
       method: "POST",
       headers: {"x-vqd-4": x4, ...headers},
@@ -125,112 +162,119 @@ app.post("/v1/chat/completions", validator('json', (value, c) => {
     })
 
     if (!resp.ok) {
-      return c.json({"error": "api request error", "message": await resp.text()}, 400)
+      const errorText = await resp.text()
+      logger.error('DuckDuckGo API request failed', {
+        status: resp.status,
+        statusText: resp.statusText,
+        error: errorText
+      })
+      return c.json({"error": "api request error", "message": errorText}, 400)
     }
+
     c.header("x-vqd-4", resp.headers.get("x-vqd-4") || "")
-    let responseContent = ""
+
     if (params.stream) {
+      logger.info('Starting SSE stream')
       return streamSSE(c, async (stream) => {
         if (!resp.body) {
+          logger.error('No response body available for streaming')
           return
         }
-        const reader = resp.body.getReader();
-        let decoder = new TextDecoder();
-        let buffer = '';
+
+        const reader = resp.body.getReader()
+        let decoder = new TextDecoder()
+        let buffer = ''
+
         try {
           while (true) {
-            const {done, value} = await reader.read();
+            const {done, value} = await reader.read()
             if (done) {
-              break;
+              break
             }
-            buffer += decoder.decode(value, {stream: true});
-            const parts = buffer.split('\n');
-            buffer = parts.pop() || '';
+
+            buffer += decoder.decode(value, {stream: true})
+            const parts = buffer.split('\n')
+            buffer = parts.pop() || ''
+
             for (let part of parts) {
-              let response = null;
-              part = part.substring(6)//remove data:
+              part = part.substring(6) // remove data:
+              
               if (part === "[DONE]") {
                 const openAIResponse = {
                   id: "chat-",
                   object: "chat.completion",
-                  created: (new Date()).getTime(),
+                  created: Date.now(),
                   model: params.model,
-                  choices: [
-                    {
-                      index: 0,
-                      finish_reason: "stop",
-                      content_filter_results: null,
-                      delta: {}
-                    }
-                  ],
+                  choices: [{
+                    index: 0,
+                    finish_reason: "stop",
+                    content_filter_results: null,
+                    delta: {}
+                  }],
                   system_fingerprint: "fp_44709d6fcb"
                 }
 
-                await stream.writeSSE({
-                  data: JSON.stringify(openAIResponse),
-                });
-
-                await stream.writeSSE({
-                  data: "[DONE]"
-                });
+                await stream.writeSSE({ data: JSON.stringify(openAIResponse) })
+                await stream.writeSSE({ data: "[DONE]" })
+                logger.info('Stream completed')
                 return
               }
+
               try {
-                response = JSON.parse(part)
-              } catch {
-                console.log('response parse error')
-              }
-              if (response) {
+                const response = JSON.parse(part)
                 const openAIResponse: OpenAIStreamResponse = {
                   id: "chatcmpl-duckduck-ai",
                   object: "chat.completion",
-                  created: (new Date()).getTime() / 1000,
+                  created: Date.now() / 1000,
                   model: params.model,
-                  choices: [
-                    {
-                      index: 0,
-                      delta: {
-                        role: response["role"],
-                        content: response["message"]
-                      },
-                      finish_reason: null,
-                      content_filter_results: null,
-                    }
-                  ]
+                  choices: [{
+                    index: 0,
+                    delta: {
+                      role: response["role"],
+                      content: response["message"]
+                    },
+                    finish_reason: null,
+                    content_filter_results: null,
+                  }]
                 }
 
-                await stream.writeSSE({
-                  data: JSON.stringify(openAIResponse),
-                });
+                await stream.writeSSE({ data: JSON.stringify(openAIResponse) })
+              } catch (error) {
+                logger.error('Error parsing stream response', error)
               }
             }
           }
-        } catch (e) {
-          console.error("Error reading from SSE stream:", e);
+        } catch (error) {
+          logger.error('Stream processing error', error)
         } finally {
-          reader.releaseLock();
+          reader.releaseLock()
         }
-      });
+      })
     }
+
+    // Non-streaming response handling
     if (resp.body) {
       const buffer = await resp.text()
+      let responseContent = ""
+      
       const parts = buffer.split("\n\n")
       for (let part of parts) {
         part = part.substring(6)
-        if(part === "[DONE]"){
-          break;
+        if (part === "[DONE]") {
+          break
         }
         try {
           const parseJson = JSON.parse(part)
-          responseContent += parseJson["message"]??''
-        } catch {
-          console.log('parse error')
+          responseContent += parseJson["message"] ?? ''
+        } catch (error) {
+          logger.error('Error parsing response part', error)
         }
       }
+
       const response: OpenAIResponse = {
         id: "chatcmpl-duckduck-ai",
         object: "chat.completion",
-        created: (new Date()).getTime() / 1000,
+        created: Date.now() / 1000,
         model: params.model,
         system_fingerprint: "fp_44709d6fcb",
         choices: [{
@@ -248,12 +292,18 @@ app.post("/v1/chat/completions", validator('json', (value, c) => {
           total_tokens: 0
         }
       }
+
+      logger.info('Request completed successfully', {
+        model: params.model,
+        responseLength: responseContent.length
+      })
+
       return c.json(response)
     }
-  } catch
-    (e) {
-    return c.json({error: e}, 400)
+  } catch (error) {
+    logger.error('Unexpected error in chat completion endpoint', error)
+    return c.json({error: error}, 400)
   }
-
 })
+
 export default app
