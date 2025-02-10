@@ -4,7 +4,7 @@ import { validator } from "hono/validator"
 import { OpenAIRequest, OpenAIResponse, OpenAIStreamResponse } from "./types"
 import { streamSSE } from 'hono/streaming'
 import { cors } from 'hono/cors'
-
+ 
 // Enhanced logging function
 const logger = {
   info: (message: string, data?: any) => {
